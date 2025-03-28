@@ -22,6 +22,7 @@ import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.CoreOptions;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.actions.DeleteOrphanFiles;
 
 public class Actions {
 
@@ -48,5 +49,9 @@ public class Actions {
 
   public RewriteDataFilesAction rewriteDataFiles() {
     return new RewriteDataFilesAction(env, table);
+  }
+
+  public DeleteOrphanFiles cleanOrphanDataFiles() {
+    return new DeleteOrphanFilesAction(env, table);
   }
 }
