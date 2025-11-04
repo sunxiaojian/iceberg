@@ -829,6 +829,10 @@ public class HiveCatalog extends BaseMetastoreViewCatalog
   public void close() throws IOException {
     super.close();
 
+    if (clients != null) {
+      clients.close();
+    }
+
     if (keyManagementClient != null) {
       keyManagementClient.close();
     }

@@ -21,6 +21,7 @@ package org.apache.iceberg.hive;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Scheduler;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Comparator;
@@ -28,6 +29,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import org.apache.hadoop.conf.Configuration;
@@ -45,6 +47,8 @@ import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.ThreadPools;
 import org.apache.thrift.TException;
 import org.immutables.value.Value;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A ClientPool that caches the underlying HiveClientPool instances.
@@ -64,11 +68,13 @@ import org.immutables.value.Value;
  *       wouldn't share the same client pool. Multiple conf elements can be specified.
  * </ul>
  */
-public class CachedClientPool implements ClientPool<IMetaStoreClient, TException> {
+public class CachedClientPool implements Closeable, ClientPool<IMetaStoreClient, TException> {
 
+  private static final Logger LOG = LoggerFactory.getLogger(CachedClientPool.class);
   private static final String CONF_ELEMENT_PREFIX = "conf:";
 
   private static Cache<Key, HiveClientPool> clientPoolCache;
+  private static ScheduledExecutorService cacheCleanerExecutor;
 
   private final Configuration conf;
   private final int clientPoolSize;
@@ -100,13 +106,12 @@ public class CachedClientPool implements ClientPool<IMetaStoreClient, TException
     if (clientPoolCache == null) {
       // Since Caffeine does not ensure that removalListener will be involved after expiration
       // We use a scheduler with one thread to clean up expired clients.
+      cacheCleanerExecutor = ThreadPools.newScheduledPool("hive-metastore-cleaner", 1);
       clientPoolCache =
           Caffeine.newBuilder()
               .expireAfterAccess(evictionInterval, TimeUnit.MILLISECONDS)
               .removalListener((ignored, value, cause) -> ((HiveClientPool) value).close())
-              .scheduler(
-                  Scheduler.forScheduledExecutorService(
-                      ThreadPools.newScheduledPool("hive-metastore-cleaner", 1)))
+              .scheduler(Scheduler.forScheduledExecutorService(cacheCleanerExecutor))
               .build();
     }
   }
@@ -185,6 +190,48 @@ public class CachedClientPool implements ClientPool<IMetaStoreClient, TException
       elements.add(ConfElement.of(key, confElements.get(key)));
     }
     return Key.of(elements);
+  }
+
+  /**
+   * Closes this stream and releases any system resources associated with it. If the stream is
+   * already closed then invoking this method has no effect.
+   *
+   * <p>As noted in {@link AutoCloseable#close()}, cases where the close may fail require careful
+   * attention. It is strongly advised to relinquish the underlying resources and to internally
+   * <em>mark</em> the {@code Closeable} as closed, prior to throwing the {@code IOException}.
+   *
+   * <p>This method closes all cached client pools and clears the entire cache. Since the cache is
+   * shared across all instances, closing one instance will release all resources to prevent
+   * resource leaks.
+   *
+   * @throws IOException if an I/O error occurs
+   */
+  @Override
+  public void close() throws IOException {
+    if (clientPoolCache != null) {
+      // Iterate through all cached pools and close them
+      for (Map.Entry<Key, HiveClientPool> entry : clientPoolCache.asMap().entrySet()) {
+        HiveClientPool pool = entry.getValue();
+        if (pool != null && !pool.isClosed()) {
+          try {
+            pool.close();
+          } catch (Exception e) {
+            LOG.warn("Failed to close HiveClientPool for key: {}", entry.getKey(), e);
+          }
+        }
+      }
+
+      // Clear the entire cache after closing all pools
+      clientPoolCache.invalidAll();
+      clientPoolCache.cleanUp();
+      clientPoolCache = null;
+
+      // Shutdown the cleaner executor service to prevent thread leak
+      if (cacheCleanerExecutor != null) {
+        cacheCleanerExecutor.shutdownNow();
+        cacheCleanerExecutor = null;
+      }
+    }
   }
 
   @Value.Immutable
